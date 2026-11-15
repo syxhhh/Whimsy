@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿# Whimsy - Windows 终端智能体（单文件，零依赖，PowerShell 5.1+）
 <#
   Whimsy —— 单文件、零依赖的 Windows 终端智能体
   目标环境：全新 Windows 10/11，无需 Python / Node / git / 任何运行时

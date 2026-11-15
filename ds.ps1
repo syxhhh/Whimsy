@@ -25,6 +25,16 @@ $CFG = @{
     MaxToolOut  = 3500
     MaxInputLen = 12000
 }
+$REPAIR = @'
+【格式错误】你上一条回复里出现了工具调用的痕迹，但没有能被解析出来的工具块。
+执行器只认这一种格式，一个字符都不能差：
+
+<tool>{"name":"run","command":"Get-ChildItem"}</tool>
+
+请立刻重新输出：只输出一个这样的工具块，不要附加任何说明文字。
+如果你认为任务已经做完、不需要再操作电脑，那就直接用中文回答结果，不要输出任何尖括号标签。
+'@
+
 $SYS = @'
 你是一个运行在 Windows 上的终端智能体，可以操作这台电脑完成实际任务。
 
@@ -44,6 +54,8 @@ $SYS = @'
 - 任务完成后直接用中文回答，不要再调用工具。
 - 这台机器是 Windows PowerShell，没有 ls / cat / rm / grep，请用 Get-ChildItem / Get-Content / Remove-Item / Select-String。
 - 每次 run 都是一个全新的独立进程：上一次的 cd 和变量不会保留。需要连续操作时写成一条命令，或全部用绝对路径。
+- 命令必须能在 60 秒内自己结束。禁止跑这类会卡住终端的命令：Read-Host、pause、ping -t、不带参数的交互式程序、会弹窗等待的程序、常驻服务或服务器。
+- 结果里的「退出码: N」是真实退出码。非 0 就是失败了，先看输出再决定要不要换做法，不要原地重试同一条命令。
 - 读文本文件优先用 read 工具，不要用 Get-Content：PowerShell 5.1 默认按 GBK 解码，读 UTF-8 文件会满屏乱码。
 - 不要输出多余的说明文字，先干活。
 '@
@@ -93,6 +105,27 @@ function Get-FreePort {
     $p = $l.LocalEndpoint.Port
     $l.Stop()
     return $p
+}
+
+function Clear-StaleBrowser {
+    param([string]$ProfileDir)
+    # 上次异常退出时，浏览器进程可能还占着配置目录。再启动时浏览器会把请求转给
+    # 旧实例然后自己退出，我们看到的就只是「调试端口连不上」。
+    # 只杀命令行里带本项目 profile 路径的进程，绝不碰用户自己开的浏览器。
+    $killed = 0
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='msedge.exe' or Name='chrome.exe'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            $cl = [string]$p.CommandLine
+            if ($cl -and $cl.IndexOf($ProfileDir, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                try {
+                    Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+                    $killed++
+                } catch {}
+            }
+        }
+    } catch {}
+    return $killed
 }
 
 # ============================================================ CDP 客户端
@@ -345,7 +378,7 @@ function Invoke-Ask {
 
 # ============================================================ 工具
 $DANGER = @(
-    '\bRemove-Item\b.*-Recurse', '\bformat\b', '\bdiskpart\b', '\bClear-Disk\b',
+    '\bRemove-Item\b.*-Recurse', '\bformat\s+[a-z]:', '\bdiskpart\b', '\bClear-Disk\b',
     '\bInitialize-Disk\b', '\bRemove-Partition\b', '\breg\s+delete\b',
     '\bStop-Computer\b', '\bRestart-Computer\b', '\bshutdown\b',
     'Remove-Item\s+[A-Za-z]:\\?\s*$', 'rd\s+/s\s+/q\s+[A-Za-z]:'
@@ -361,7 +394,15 @@ function Cut-Text {
     param([string]$Text, [int]$Max)
     if ($null -eq $Text) { return '' }
     if ($Text.Length -le $Max) { return $Text }
-    return $Text.Substring(0, $Max) + "`n…（已截断，原文 $($Text.Length) 字符）"
+    # 一条命令的报错常常在最后几行，只留头部会把最关键的线索砍掉。
+    # 照 DSA 的做法：留头 72%、留尾 28%，中间省略并说明怎么再取。
+    $keep = [Math]::Max(300, $Max - 260)
+    $headLen = [int]($keep * 0.72)
+    $tailLen = [int]($keep * 0.28)
+    $head = $Text.Substring(0, $headLen)
+    $tail = $Text.Substring($Text.Length - $tailLen)
+    $cut = $Text.Length - $headLen - $tailLen
+    return "$head`n`n… [中间省略 $cut 字符，共 $($Text.Length) 字符。要看具体内容请缩小范围（加筛选条件、只查某几项）] …`n`n$tail"
 }
 
 function Invoke-ShellText {
@@ -372,6 +413,9 @@ function Invoke-ShellText {
     # 而本脚本全局是 $ErrorActionPreference='Stop'，于是「命令明明成功、只是输出走了 stderr」
     # 会被误判成「执行失败」。这里的做法是把命令写进临时脚本，在子进程内就把
     # ErrorRecord 还原成纯文本再输出到 stdout，父进程拿到的就永远是干净文本。
+    #
+    # 这套思路是照 D:\DSA 的 run_shell 来的：它是把 stdout 和 stderr 一起重定向进
+    # 一个临时文件（stderr=STDOUT），从头到尾不碰「错误流」这个概念，所以永远不会误判。
     $tmp = Join-Path $env:TEMP ('whimsy_run_' + [guid]::NewGuid().ToString('N') + '.ps1')
     $body = @"
 `$ProgressPreference = 'SilentlyContinue'
@@ -384,18 +428,24 @@ $Command
 }
 catch {
     "执行出错：`$(`$_.Exception.Message)"
+    exit 1
 }
+if (`$null -ne `$LASTEXITCODE) { exit `$LASTEXITCODE }
 "@
     [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($true)))
+    $code = 0
     try {
         $prev = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 0
         $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $tmp 2>&1 | Out-String
+        if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
         $ErrorActionPreference = $prev
     }
     finally {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     }
+    $script:LastExitCode = $code
     return $out
 }
 
@@ -415,14 +465,29 @@ function Invoke-Tool {
                 Write-Host ''
                 N-Warn '这条命令可能删除数据，需要你确认：'
                 Write-Host "      $c" -ForegroundColor White
-                $a = Read-Host '      执行吗？(y/N)'
+                $a = ''
+                try { $a = Read-Host '      执行吗？(y/N)' }
+                catch {
+                    # 非交互场景（被当成脚本调用、或终端不可输入）不能在这里卡死
+                    $a = 'n'
+                    Write-Host '      （当前不是交互终端，按「不执行」处理）' -ForegroundColor DarkYellow
+                }
                 if ($a -notmatch '^(y|Y|yes|YES)$') { return '用户拒绝执行这条命令，请换一种方式。' }
             }
 
             try {
+                $sw = [Diagnostics.Stopwatch]::StartNew()
                 $out = (Invoke-ShellText $c).Trim()
-                if ([string]::IsNullOrWhiteSpace($out)) { return '(命令执行完成，没有输出)' }
-                return (Cut-Text $out $CFG.MaxToolOut)
+                $sec = [int]$sw.Elapsed.TotalSeconds
+                $code = [int]$script:LastExitCode
+                if ([string]::IsNullOrWhiteSpace($out)) { $out = '(没有输出)' }
+                $out = Cut-Text $out $CFG.MaxToolOut
+                # 让模型知道命令到底成没成，而不是靠猜输出内容
+                if ($code -ne 0 -and -not $out.StartsWith('执行出错')) {
+                    $out = "退出码: $code（非 0 说明命令失败）`n$out"
+                }
+                if ($sec -ge 20) { $out += "`n（这条命令耗时 $sec 秒）" }
+                return $out
             }
             catch { return "执行失败：$($_.Exception.Message)" }
         }
@@ -499,27 +564,55 @@ function Get-ToolCall {
 
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
 
+    $bodies = New-Object System.Collections.ArrayList
+
+    # 1) 标准格式 <tool>{...}</tool>
     $m = [regex]::Match($Text, '(?s)<tool>\s*(\{.*?\})\s*</tool>')
-    if (-not $m.Success) {
-        # 容错：模型可能漏了闭合标签
+    if ($m.Success) { [void]$bodies.Add($m.Groups[1].Value) }
+
+    # 2) 模型漏了闭合标签
+    if ($bodies.Count -eq 0) {
         $m2 = [regex]::Match($Text, '(?s)<tool>\s*(\{.*\})\s*$')
-        if (-not $m2.Success) { return $null }
-        $m = $m2
+        if ($m2.Success) { [void]$bodies.Add($m2.Groups[1].Value) }
     }
 
-    $json = $m.Groups[1].Value.Trim()
-    try { return ($json | ConvertFrom-Json) } catch {}
+    # 3) 包在 ```json 代码块里
+    foreach ($f in [regex]::Matches($Text, '(?s)```[a-zA-Z]*\s*(\{.*?\})\s*```')) {
+        [void]$bodies.Add($f.Groups[1].Value)
+    }
 
-    # 容错：末尾多余的逗号
-    $fixed = $json -replace ',\s*}', '}'
-    try { return ($fixed | ConvertFrom-Json) } catch {}
+    # 4) 整条回复就是一个 JSON
+    $trimmed = $Text.Trim()
+    if ($trimmed.StartsWith('{') -and $trimmed.EndsWith('}')) { [void]$bodies.Add($trimmed) }
+
+    foreach ($raw in $bodies) {
+        $json = ([string]$raw).Trim()
+        try { return ($json | ConvertFrom-Json) } catch {}
+        # 容错：末尾多余的逗号
+        $fixed = $json -replace ',\s*}', '}' -replace ',\s*\]', ']'
+        try { return ($fixed | ConvertFrom-Json) } catch {}
+    }
 
     return $null
+}
+
+function Test-ToolMarkup {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    # 出现这些痕迹，说明模型「想调工具但没按协议写」
+    return [bool]($Text -match '(?i)<\s*/?\s*tool\b|DSML|\|tool|\|invoke|"name"\s*:\s*"')
 }
 
 function Get-CleanReply {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+
+    # 模型用了 <final>…</final> 就只取里面（DSA 的协议，模型偶尔会主动套上）
+    $f = [regex]::Match($Text, '(?s)<final>\s*(.*?)\s*</final>')
+    if ($f.Success -and -not (Test-ToolMarkup $f.Groups[1].Value)) {
+        return $f.Groups[1].Value.Trim()
+    }
+
     $t = [regex]::Replace($Text, '(?s)<tool>\s*\{.*?\}\s*(</tool>)?', '')
     return $t.Trim()
 }
@@ -536,6 +629,12 @@ function Start-Browser {
     $profDir = Join-Path $CFG.Home 'profile'
     if (-not (Test-Path -LiteralPath $profDir)) {
         New-Item -ItemType Directory -Path $profDir -Force | Out-Null
+    }
+
+    $stale = Clear-StaleBrowser $profDir
+    if ($stale -gt 0) {
+        N-Warn "清理了 $stale 个上次没退干净的浏览器进程（不影响你自己开的浏览器）"
+        Start-Sleep -Milliseconds 600
     }
 
     $port = Get-FreePort
@@ -570,8 +669,8 @@ function Start-Browser {
     }
     if (-not $list) {
         N-Bad '浏览器没有响应'
-        N-Line '  多半是上一次的窗口没关，独占着配置目录。' 'White'
-        N-Line "  请先关掉所有 Edge 窗口，或在任务管理器结束 msedge.exe 后重试。" 'White'
+        N-Line '  已经自动清理过一次残留进程了，还是连不上。' 'White'
+        N-Line '  请手动确认：任务管理器里结束所有 msedge.exe / chrome.exe，然后重跑这行命令。' 'White'
         throw '浏览器启动失败'
     }
 
@@ -666,6 +765,29 @@ function Invoke-NewChat {
 }
 
 # ============================================================ 主循环
+# 每个任务都会开一个全新的网页会话（否则历史工具调用会把上下文撑爆），
+# 所以「刚才那个文件」「继续」这类话得靠这里补回来。照 DSA 的 build_history_block。
+$script:History = @()
+
+function Get-HistoryBlock {
+    if ($script:History.Count -eq 0) { return '' }
+    $lines = @('【本窗口之前的对话（用来理解上下文；已经做完的事不要重复做）】')
+    $from = [Math]::Max(0, $script:History.Count - 3)
+    $n = 0
+    for ($k = $from; $k -lt $script:History.Count; $k++) {
+        $n++
+        $h = $script:History[$k]
+        $t = ([string]$h.task) -replace '\s+', ' '
+        $r = ([string]$h.result) -replace '\s+', ' '
+        if ($t.Length -gt 200) { $t = $t.Substring(0, 200) + '…' }
+        if ($r.Length -gt 400) { $r = $r.Substring(0, 400) + '…' }
+        if ([string]::IsNullOrWhiteSpace($r)) { $r = '(无)' }
+        $lines += "$n. 用户：$t"
+        $lines += "   你的答复：$r"
+    }
+    return ($lines -join "`n") + "`n`n"
+}
+
 function Invoke-OneTask {
     param([string]$Task)
 
@@ -674,7 +796,7 @@ function Invoke-OneTask {
 
     Invoke-NewChat | Out-Null
 
-    $prompt = $SYS + "`n`n[用户任务]`n" + $Task
+    $prompt = $SYS + "`n`n" + (Get-HistoryBlock) + "[用户任务]`n" + $Task
     if ($prompt.Length -gt $CFG.MaxInputLen) {
         $prompt = $SYS + "`n`n[用户任务]`n" + $Task.Substring(0, $CFG.MaxInputLen)
     }
@@ -682,11 +804,22 @@ function Invoke-OneTask {
     $reply = Invoke-Ask $prompt
     $turn = 0
     $acted = $false
+    $repaired = 0
 
     while ($turn -lt $CFG.MaxTurns) {
         $turn++
         $call = Get-ToolCall $reply
-        if (-not $call) { break }
+
+        if (-not $call) {
+            # 想调工具但格式写歪了：绝不能把生标签当答复打给用户，要求它重写一次
+            if ((Test-ToolMarkup $reply) -and $repaired -lt 1) {
+                $repaired++
+                N-Warn '模型这次的工具格式不对，正在要求它重写…'
+                $reply = Invoke-Ask $REPAIR
+                continue
+            }
+            break
+        }
 
         $tname = [string]$call.name
         $label = $tname
@@ -710,7 +843,14 @@ function Invoke-OneTask {
     }
 
     $final = Get-CleanReply $reply
-    if ($final.Length -gt 0) {
+    if ($final.Length -gt 0 -and (Test-ToolMarkup $final)) {
+        # 重写也没纠过来：宁可说清楚，也不要把一堆标签糊到用户脸上
+        Write-Host ''
+        Write-Host '（模型这一轮用了执行器不认识的工具写法，连重写都没纠正过来，这一步没执行）' -ForegroundColor DarkYellow
+        Write-Host '  换个说法再问一次通常就好。' -ForegroundColor DarkGray
+        Write-Host ''
+    }
+    elseif ($final.Length -gt 0) {
         Write-Host ''
         Write-Host $final -ForegroundColor White
         Write-Host ''
@@ -727,6 +867,14 @@ function Invoke-OneTask {
         Write-Host '（命令已执行完，模型这次没有给出总结）' -ForegroundColor DarkYellow
         Write-Host '  可以接着追问，例如「刚才的结果是什么」。' -ForegroundColor DarkGray
         Write-Host ''
+    }
+
+    # 记下这一轮，供下一个任务接上下文（新会话里模型本身是失忆的）
+    $record = $final
+    if ([string]::IsNullOrWhiteSpace($record)) { $record = '（这一步没有给出文字总结）' }
+    $script:History += @{ task = $Task; result = $record }
+    if ($script:History.Count -gt 8) {
+        $script:History = @($script:History[($script:History.Count - 8)..($script:History.Count - 1)])
     }
 }
 

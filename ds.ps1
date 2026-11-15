@@ -38,6 +38,8 @@ $REPAIR = @'
 $SYS = @'
 你是一个运行在 Windows 上的终端智能体，可以操作这台电脑完成实际任务。
 
+【当前时间】{{NOW}}
+
 【工具调用格式】
 需要操作电脑时，输出且只输出一个工具调用块：
 <tool>{"name":"run","command":"Get-ChildItem -Force"}</tool>
@@ -57,8 +59,23 @@ $SYS = @'
 - 命令必须能在 60 秒内自己结束。禁止跑这类会卡住终端的命令：Read-Host、pause、ping -t、不带参数的交互式程序、会弹窗等待的程序、常驻服务或服务器。
 - 结果里的「退出码: N」是真实退出码。非 0 就是失败了，先看输出再决定要不要换做法，不要原地重试同一条命令。
 - 读文本文件优先用 read 工具，不要用 Get-Content：PowerShell 5.1 默认按 GBK 解码，读 UTF-8 文件会满屏乱码。
+- 时间类问题（今天几号、现在几点、周几）直接用上面的【当前时间】回答，不要跑命令去查。
+- 用户如果是在追问或纠正上一句（例如「连着呢」「不对」「再看看」），先结合【本窗口之前的对话】修正上一次的结论，再决定要不要动手。不要重新自我介绍，也不要假装是第一次对话。
 - 不要输出多余的说明文字，先干活。
+
+【查硬件时的取值对照，别猜】
+- 电池：Get-CimInstance Win32_Battery | Select-Object Name,EstimatedChargeRemaining,BatteryStatus
+  BatteryStatus 的含义：1=正在用电池（放电中，没接电源）；2=已接电源（交流供电，系统没在放电，但不一定在充电）；3=已充满；6/7/8/9/11=正在充电。
+  所以 2 是「接着电源」，绝不能答成「未接电源 / 正在放电」。
+- 只看电量百分比就等于 EstimatedChargeRemaining；接电源与否则看 BatteryStatus，两者不是一回事。
+- CPU：Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors
+- 内存：Get-CimInstance Win32_ComputerSystem | Select-Object TotalPhysicalMemory（单位字节）
+- 磁盘：Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Select-Object DeviceID,Size,FreeSpace
 '@
+
+$now = Get-Date
+$wd = @('周日', '周一', '周二', '周三', '周四', '周五', '周六')[[int]$now.DayOfWeek]
+$SYS = $SYS.Replace('{{NOW}}', ("{0:yyyy-MM-dd HH:mm} {1}" -f $now, $wd))
 
 # ============================================================ 输出
 function N-Line { param($t, $c = 'Gray') Write-Host $t -ForegroundColor $c }
@@ -417,14 +434,19 @@ function Invoke-ShellText {
     # 这套思路是照 D:\DSA 的 run_shell 来的：它是把 stdout 和 stderr 一起重定向进
     # 一个临时文件（stderr=STDOUT），从头到尾不碰「错误流」这个概念，所以永远不会误判。
     $tmp = Join-Path $env:TEMP ('whimsy_run_' + [guid]::NewGuid().ToString('N') + '.ps1')
+    # 注意别把结果逐条丢进 ForEach-Object 再 Out-String：Format-Table / Format-List
+    # 产生的是一组「排版数据」，被逐条处理后会被压成一行（BatteryStatus : 2 挤在 Name 那行），
+    # 模型读起来就全是错位的。正确做法是先在数组里就地替换掉错误对象，再整体 Out-String。
     $body = @"
 `$ProgressPreference = 'SilentlyContinue'
 try {
-    & {
+    `$raw = @(& {
 $Command
-    } 2>&1 | ForEach-Object {
-        if (`$_ -is [System.Management.Automation.ErrorRecord]) { `$_.Exception.Message } else { `$_ }
-    } | Out-String -Width 300
+    } 2>&1)
+    for (`$i = 0; `$i -lt `$raw.Count; `$i++) {
+        if (`$raw[`$i] -is [System.Management.Automation.ErrorRecord]) { `$raw[`$i] = `$raw[`$i].Exception.Message }
+    }
+    `$raw | Out-String -Width 200
 }
 catch {
     "执行出错：`$(`$_.Exception.Message)"
@@ -784,6 +806,9 @@ function Get-HistoryBlock {
         if ([string]::IsNullOrWhiteSpace($r)) { $r = '(无)' }
         $lines += "$n. 用户：$t"
         $lines += "   你的答复：$r"
+        $cmd = ([string]$h.cmd) -replace '\s+', ' '
+        if ($cmd.Length -gt 160) { $cmd = $cmd.Substring(0, 160) + '…' }
+        if ($cmd) { $lines += "   当时执行的命令：$cmd" }
     }
     return ($lines -join "`n") + "`n`n"
 }
@@ -805,6 +830,19 @@ function Invoke-OneTask {
     $turn = 0
     $acted = $false
     $repaired = 0
+    $lastCmd = ''
+
+    # 网页偶尔会出现「回答还没渲染完就被读到」的情况，拿回来是空串。
+    # 这时不要马上判死，先回头把页面再多读几遍——比让用户「换个说法重问」靠谱得多。
+    if ([string]::IsNullOrWhiteSpace((Get-CleanReply $reply)) -and -not (Test-ToolMarkup $reply)) {
+        for ($k = 0; $k -lt 4; $k++) {
+            Start-Sleep -Milliseconds 1200
+            try { $s = Get-Snapshot } catch { break }
+            $cand = [string]$s.last
+            if ($cand) { $reply = $cand }
+            if (-not [string]::IsNullOrWhiteSpace((Get-CleanReply $reply))) { break }
+        }
+    }
 
     while ($turn -lt $CFG.MaxTurns) {
         $turn++
@@ -833,6 +871,7 @@ function Invoke-OneTask {
 
         $result = Invoke-Tool $call
         $acted = $true
+        if ($tname -eq 'run') { $lastCmd = [string]$call.command }
 
         $preview = $result -replace "`r?`n", ' '
         if ($preview.Length -gt 110) { $preview = $preview.Substring(0, 110) + '…' }
@@ -872,7 +911,7 @@ function Invoke-OneTask {
     # 记下这一轮，供下一个任务接上下文（新会话里模型本身是失忆的）
     $record = $final
     if ([string]::IsNullOrWhiteSpace($record)) { $record = '（这一步没有给出文字总结）' }
-    $script:History += @{ task = $Task; result = $record }
+    $script:History += @{ task = $Task; result = $record; cmd = $lastCmd }
     if ($script:History.Count -gt 8) {
         $script:History = @($script:History[($script:History.Count - 8)..($script:History.Count - 1)])
     }
@@ -882,6 +921,23 @@ function Start-Agent {
     if ($env:WHIMSY_ONESHOT) {
         try { Invoke-OneTask $env:WHIMSY_ONESHOT }
         catch { N-Bad $_.Exception.Message }
+        return
+    }
+
+    # 一次跑多条任务（用换行分隔），共用同一个会话，上下文会延续。
+    # 批量脚本和自测都用这个入口。
+    if ($env:WHIMSY_TASKS) {
+        foreach ($t in ($env:WHIMSY_TASKS -split "`n")) {
+            if ([string]::IsNullOrWhiteSpace($t)) { continue }
+            Write-Host ''
+            N-Head "你 > $($t.Trim())"
+            try { Invoke-OneTask $t.Trim() }
+            catch {
+                Write-Host ''
+                N-Bad $_.Exception.Message
+                $script:lastTick = -1
+            }
+        }
         return
     }
 

@@ -4,7 +4,7 @@
 
 不需要 Python、不需要 Node、不需要 git、不需要 API Key、不花钱。
 
-> 当前版本 v1.1（2026-11-15）：修复了 `java -version`、`git`、`pip` 这类把结果写到 stderr 的程序被误判为「执行失败」的问题。
+> 当前版本 v1.2（2026-11-15）：对齐了 `D:\DSA` 里已经踩过坑的那几处——外部程序 stderr 不再被误判为失败、返回值带真实退出码、工具格式跑偏会自动要求重写、残留浏览器进程自动清理、跨任务带上下文。
 
 ## 一行启动
 
@@ -81,6 +81,7 @@ curl.exe -sL https://raw.githubusercontent.com/syxhhh/Whimsy/main/ds.ps1 -o "$en
 | 建文件 + 读回验证（2 步） | 15 秒 |
 | 查 CPU 和内存 | 13 秒 |
 | 读 GBK 编码的中文文件 | 10 秒 |
+| 查 Java 环境（含 javac、JAVA_HOME、PATH 里真正生效的那个 java） | 11 秒 |
 
 每一步约 5–8 秒，因为要走「网页版思考 + DOM 轮询」。这是免费换来的代价。
 
@@ -120,6 +121,8 @@ $env:WHIMSY_HOME='D:\myagent'
 | 中文变成乱码 | 极少数终端的代码页异常 | 先执行 `chcp 936` |
 | 命令明明成功了，却显示「执行失败：java : openjdk version…」 | v1.0 的 bug：`java -version`、`git`、`pip` 这类程序把结果写到 stderr，被误判成报错 | v1.1 已修复，重新下载脚本即可 |
 | 执行完命令后没有任何输出，直接回到 `你 >` | v1.0 的 bug：模型这一轮没写总结时什么都不打印 | v1.1 已补上提示 |
+| `Get-ChildItem | Format-Table` 被当成「格式化磁盘」要求确认 | v1.1 的危险规则 `\bformat\b` 误伤 `Format-Table` / `Format-List` | v1.2 已改为只匹配 `format 盘符:` |
+| 模型输出一堆尖括号标签，直接糊在屏幕上 | v1.1 解析失败时把原始文本当答复打印 | v1.2 已改为要求模型重写一次 |
 
 ## 备选：API 版（更快，但需要 Key）
 

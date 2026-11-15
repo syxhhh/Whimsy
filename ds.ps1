@@ -43,6 +43,7 @@ $SYS = @'
 - 工具结果会以 <result>…</result> 的形式发给你。
 - 任务完成后直接用中文回答，不要再调用工具。
 - 这台机器是 Windows PowerShell，没有 ls / cat / rm / grep，请用 Get-ChildItem / Get-Content / Remove-Item / Select-String。
+- 每次 run 都是一个全新的独立进程：上一次的 cd 和变量不会保留。需要连续操作时写成一条命令，或全部用绝对路径。
 - 读文本文件优先用 read 工具，不要用 Get-Content：PowerShell 5.1 默认按 GBK 解码，读 UTF-8 文件会满屏乱码。
 - 不要输出多余的说明文字，先干活。
 '@
@@ -363,6 +364,41 @@ function Cut-Text {
     return $Text.Substring(0, $Max) + "`n…（已截断，原文 $($Text.Length) 字符）"
 }
 
+function Invoke-ShellText {
+    param([string]$Command)
+
+    # 外部程序（java -version、git、pip、npm…）把结果写到 stderr 是正常行为。
+    # 如果直接 & powershell -Command 再 2>&1，PowerShell 会把它包装成 ErrorRecord；
+    # 而本脚本全局是 $ErrorActionPreference='Stop'，于是「命令明明成功、只是输出走了 stderr」
+    # 会被误判成「执行失败」。这里的做法是把命令写进临时脚本，在子进程内就把
+    # ErrorRecord 还原成纯文本再输出到 stdout，父进程拿到的就永远是干净文本。
+    $tmp = Join-Path $env:TEMP ('whimsy_run_' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $body = @"
+`$ProgressPreference = 'SilentlyContinue'
+try {
+    & {
+$Command
+    } 2>&1 | ForEach-Object {
+        if (`$_ -is [System.Management.Automation.ErrorRecord]) { `$_.Exception.Message } else { `$_ }
+    } | Out-String -Width 300
+}
+catch {
+    "执行出错：`$(`$_.Exception.Message)"
+}
+"@
+    [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($true)))
+    try {
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $tmp 2>&1 | Out-String
+        $ErrorActionPreference = $prev
+    }
+    finally {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    }
+    return $out
+}
+
 function Invoke-Tool {
     param($Call)
 
@@ -383,9 +419,8 @@ function Invoke-Tool {
                 if ($a -notmatch '^(y|Y|yes|YES)$') { return '用户拒绝执行这条命令，请换一种方式。' }
             }
 
-            Write-Host "      > $c" -ForegroundColor DarkGray
             try {
-                $out = & powershell -NoProfile -ExecutionPolicy Bypass -Command $c 2>&1 | Out-String
+                $out = (Invoke-ShellText $c).Trim()
                 if ([string]::IsNullOrWhiteSpace($out)) { return '(命令执行完成，没有输出)' }
                 return (Cut-Text $out $CFG.MaxToolOut)
             }
@@ -655,8 +690,10 @@ function Invoke-OneTask {
 
         $tname = [string]$call.name
         $label = $tname
-        if ($call.command) { $label = "$tname : $($call.command)" }
-        elseif ($call.path) { $label = "$tname : $($call.path)" }
+        if ($call.command) { $label = "$tname · $($call.command)" }
+        elseif ($call.path) { $label = "$tname · $($call.path)" }
+        $label = $label -replace "`r?`n", ' '
+        if ($label.Length -gt 96) { $label = $label.Substring(0, 96) + '…' }
 
         Write-Host ''
         Write-Host "  [$turn] $label" -ForegroundColor DarkCyan
@@ -681,6 +718,14 @@ function Invoke-OneTask {
     elseif (-not $acted) {
         Write-Host ''
         Write-Host '（模型没有返回内容，换个说法再试一次）' -ForegroundColor DarkYellow
+        Write-Host ''
+    }
+    else {
+        # 已经执行过工具、但模型这一轮没给文字总结。以前这种情况什么都不打印，
+        # 看起来像「卡死」或「没反应」，容易让人以为出错。
+        Write-Host ''
+        Write-Host '（命令已执行完，模型这次没有给出总结）' -ForegroundColor DarkYellow
+        Write-Host '  可以接着追问，例如「刚才的结果是什么」。' -ForegroundColor DarkGray
         Write-Host ''
     }
 }

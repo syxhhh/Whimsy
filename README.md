@@ -4,6 +4,8 @@
 
 不需要 Python、不需要 Node、不需要 git、不需要 API Key、不花钱。
 
+> 当前版本 v1.1（2026-11-15）：修复了 `java -version`、`git`、`pip` 这类把结果写到 stderr 的程序被误判为「执行失败」的问题。
+
 ## 一行启动
 
 打开 PowerShell（Win + X → 终端），粘贴回车：
@@ -116,6 +118,8 @@ $env:WHIMSY_HOME='D:\myagent'
 | 一直停在「需要登录」 | 未登录 / 登录超时 | 在弹出窗口里完成登录 |
 | 报「找不到 Edge 或 Chrome」 | 系统被精简过浏览器 | 装一个 Edge |
 | 中文变成乱码 | 极少数终端的代码页异常 | 先执行 `chcp 936` |
+| 命令明明成功了，却显示「执行失败：java : openjdk version…」 | v1.0 的 bug：`java -version`、`git`、`pip` 这类程序把结果写到 stderr，被误判成报错 | v1.1 已修复，重新下载脚本即可 |
+| 执行完命令后没有任何输出，直接回到 `你 >` | v1.0 的 bug：模型这一轮没写总结时什么都不打印 | v1.1 已补上提示 |
 
 ## 备选：API 版（更快，但需要 Key）
 
@@ -143,8 +147,29 @@ $env:WHIMSY_MODEL='deepseek-chat'
 
 ## 环境要求
 
-- Windows 10 1803+ 或 Windows 11
-- 系统自带 Edge（或已安装 Chrome）
-- 能访问 `chat.deepseek.com`
+**能跑：**
+
+| 项 | 要求 |
+|---|---|
+| 系统 | Windows 10 1803 及以上 / Windows 11（x64、ARM64 都行） |
+| 终端 | Windows PowerShell 5.1（系统自带，`powershell.exe`）；PowerShell 7 里也能跑，启动器会自动调 5.1 |
+| 浏览器 | 系统自带 Edge，或已安装 Chrome |
+| 网络 | 能打开 `chat.deepseek.com`；下载脚本时能访问 `raw.githubusercontent.com` |
+| 账号 | 一个 DeepSeek 账号（免费） |
+
+**跑不了：**
+
+| 环境 | 原因 |
+|---|---|
+| Windows 7 / 8 / 8.1 | 没有 Chromium 版 Edge，也没有可用的调试协议 |
+| macOS / Linux | 脚本用了 `%TEMP%`、`$env:LOCALAPPDATA`、Edge 路径，是纯 Windows 实现 |
+| Windows Server Core / 精简版系统 | 没有浏览器，启动第一步就会失败 |
+| 完全没有网络 | 网页版就是模型本体，断网等于没有大脑 |
+
+**下载脚本这一步如果卡住**（`raw.githubusercontent.com` 在国内经常不通），换成 jsDelivr 镜像：
+
+```powershell
+curl.exe -sL https://cdn.jsdelivr.net/gh/syxhhh/Whimsy@main/ds.ps1 -o "$env:TEMP\w.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\w.ps1"
+```
 
 就这些。没有别的依赖。
